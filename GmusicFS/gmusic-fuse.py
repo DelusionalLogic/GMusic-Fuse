@@ -29,25 +29,36 @@ def cleanname(name):
     name = sanitizename(name)
     return name
 
-SongHandle = collections.namedtuple("SongHandle", ['response', 'count'])
+SongHandle = collections.namedtuple("SongHandle", ['buffer', 'count'])
+ApiInfo = collections.namedtuple("ApiInfo", ['api', 'deviceid'])
+
+
+def getbuffer(apiinfo, songid, length):
+    url = apiinfo.api.get_stream_url(songid, apiinfo.deviceid)
+    response = urllib2.urlopen(url)
+    return ResponseBuffer(response, length)
 
 class Song(object):
     '''Song object'''
 
-    def __init__(self, name, uid, duration, size):
+    def __init__(self, apiinfo, name, uid, duration, size):
+        self.__apiinfo = apiinfo
         self.name = name
         self.uid = uid
         self.duration = duration
         self.size = size
 
+    def getbuffer(self):
+        return getbuffer(self.__apiinfo, self.uid, self.size)
+
 class Album(object):
     '''Album Object'''
 
-    def __init__(self, name, uid, cover, artist):
+    def __init__(self, apiinfo, name, uid, cover):
+        self.__apiinfo = apiinfo
         self.name = name
         self.uid = uid
         self.cover = cover
-        self.artist = artist
         self.__songs = {}
 
     def addsong(self, song):
@@ -68,7 +79,8 @@ class Album(object):
 class Artist(object):
     '''Artist container'''
 
-    def __init__(self, name, uid):
+    def __init__(self, apiinfo, name, uid):
+        self.__apiinfo = apiinfo
         self.name = name
         self.uid = uid
         self.__albums = {}
@@ -94,15 +106,14 @@ class GMusicClient(object):
     '''
 
     def __init__(self, username, password, deviceid):
-        self.__api = Mobileclient()
-        self.__deviceid = deviceid
-        if not self.__api.login(username, password):
+        self.__apiinfo = ApiInfo(Mobileclient(), deviceid)
+        if not self.__apiinfo.api.login(username, password):
             raise Exception("Google music login failed")
         self.__dirty = True
         self.__artists = {}
 
     def __updateinfo(self):
-        songdict = self.__api.get_all_songs()
+        songdict = self.__apiinfo.api.get_all_songs()
         for song in songdict:
             if song["artist"] == "" or song["album"] == "":
                 continue
@@ -115,7 +126,7 @@ class GMusicClient(object):
                     uid = song["artistId"]
                 else:
                     uid = "UNKNOWN"
-                artist = Artist(song["artist"], uid)
+                artist = Artist(self.__apiinfo, song["artist"], uid)
                 self.__artists[key] = artist
 
             key = normalize(song["album"])
@@ -126,10 +137,10 @@ class GMusicClient(object):
                     uid = song["albumId"]
                 else:
                     uid = "UNKNOWN"
-                album = Album(song["album"], uid, "example.com", artist.name)
+                album = Album(self.__apiinfo, song["album"], uid, "example.com")
                 artist.addalbum(album)
 
-            song = Song(song["title"], song["id"], int(song["durationMillis"]), int(song["estimatedSize"]))
+            song = Song(self.__apiinfo, song["title"], song["id"], int(song["durationMillis"]), int(song["estimatedSize"]))
             album.addsong(song)
         self.__dirty = False
 
@@ -144,9 +155,6 @@ class GMusicClient(object):
         if not name in self.__artists:
             raise ValueError("No artist of that name")
         return self.__artists[name]
-
-    def getsongurl(self, song):
-        return self.__api.get_stream_url(song.uid, self.__deviceid)
 
 class Provider(object):
     #pylint: disable=R0201
@@ -184,14 +192,13 @@ class GMusicProvider(Provider):
             except AttributeError:
                 pass
         song = self.__client.getartist(artist).getalbum(album).getsong(name)
-        response = urllib2.urlopen(self.__client.getsongurl(song))
-        self.openfiles[fh] = SongHandle(ResponseBuffer(response, song.size), 1)
+        self.openfiles[fh] = SongHandle(song.getbuffer(), 1)
 
     def closesong(self, fh):
         if not fh in self.openfiles:
             raise Exception("Unexpected file close")
         if self.openfiles[fh].count <= 1:
-            self.openfiles[fh].response.close()
+            self.openfiles[fh].buffer.close()
             del self.openfiles[fh]
         else:
             self.openfiles[fh].count -= 1
@@ -199,7 +206,7 @@ class GMusicProvider(Provider):
     def getsongbytes(self, fh, size, offset, artist, album, title):
         if not fh in self.openfiles:
             raise Exception("Unexpected file read")
-        handle = self.openfiles[fh].response
+        handle = self.openfiles[fh].buffer
         handle.seek(offset)
         buf = handle.read(size)
         return buf
@@ -290,7 +297,7 @@ def main():
     username = config.get('credentials', 'username')
     password = config.get('credentials', 'password')
     deviceid = config.get('device', 'deviceid')
-    fuse = FUSE(GMusic(GMusicProvider(username, password, deviceid)), argv[1],
+    fuse = FUSE(GMusic(GMusicProvider(username, password, deviceid)), args.mountpoint,
                     foreground=args.foreground, 
                     ro=True, nothreads=True)
 

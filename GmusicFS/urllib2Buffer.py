@@ -3,11 +3,13 @@ import urllib2
 class ResponseBuffer(object):
     '''Buffer addon for urllib2 response'''
 
-    def __init__(self, response, length):
+    def __init__(self, response, length=-1):
         self.__response = response
         if "Content-Length" in response.headers:
             self.__length = response.headers['Content-Length']
         else:
+            if length == -1:
+                raise Exception("No length was given and no Content-Length header was found")
             self.__length = length
         self.__position = 0
         self.__curlength = 0
