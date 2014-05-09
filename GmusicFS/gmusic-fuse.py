@@ -6,6 +6,7 @@ import urllib2
 import random
 import ConfigParser
 import argparse
+import time
 from struct import pack
 
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
@@ -29,8 +30,10 @@ def cleanname(name):
     name = sanitizename(name)
     return name
 
-SongHandle = collections.namedtuple("SongHandle", ['buffer', 'count'])
+SongHandle = collections.namedtuple("SongHandle", ['song', 'buffer', 'count'])
+SongInfo = collections.namedtuple("SongInfo", ['artist', 'album', 'name'])
 ApiInfo = collections.namedtuple("ApiInfo", ['api', 'deviceid'])
+CacheHandle = collections.namedtuple("CacheHandle", ['filehandle', 'lastused'])
 
 
 def getbuffer(apiinfo, songid, length):
@@ -179,37 +182,65 @@ class GMusicProvider(Provider):
     def __init__(self, username, password, deviceid):
         self.__client = GMusicClient(username, password, deviceid)
         self.openfiles = {}
+        self.__closedfiles = {}
+        self.__lastgc = 0
 
     def getartist(self, artist):
         return self.__client.getartist(artist)
 
-    def opensong(self, artist, album, name, fh):
+    def __gcclosedfiles(self):
+        print "Removing closed files"
+        self.__lastgc = time.time()
+        for uid in self.__closedfiles:
+            element = self.__closedfiles[uid]
+            if time.time() - element.lastused > 10:
+                element.filehandle.buffer.close()
+                del self.__closedfiles[uid]
+
+    def opensong(self, songinfo, fh):
         if fh in self.openfiles:
-            print "Open file: " + name + "Opened again"
             try:
                 self.openfiles[fh].count += 1
                 return
             except AttributeError:
                 pass
-        song = self.__client.getartist(artist).getalbum(album).getsong(name)
-        self.openfiles[fh] = SongHandle(song.getbuffer(), 1)
+        song = self.__client.getartist(songinfo.artist).getalbum(songinfo.album).getsong(songinfo.name)
+        if song.uid in self.__closedfiles:
+            print song.name + " is in cache"
+            self.openfiles[fh] = self.__closedfiles[song.uid].filehandle
+        self.openfiles[fh] = SongHandle(song, song.getbuffer(), 1)
 
     def closesong(self, fh):
+        if time.time() - self.__lastgc > 2:
+            self.__gcclosedfiles()
         if not fh in self.openfiles:
             raise Exception("Unexpected file close")
         if self.openfiles[fh].count <= 1:
-            self.openfiles[fh].buffer.close()
-            del self.openfiles[fh]
+            self.__closedfiles[self.openfiles[fh].song.uid] = CacheHandle(self.openfiles[fh], time.time())
         else:
             self.openfiles[fh].count -= 1
 
-    def getsongbytes(self, fh, size, offset, artist, album, title):
+    def getsongbytes(self, fh, size, offset, songinfo):
         if not fh in self.openfiles:
             raise Exception("Unexpected file read")
         handle = self.openfiles[fh].buffer
         handle.seek(offset)
         buf = handle.read(size)
         return buf
+
+    def getattr(self, songinfo):
+        artist = self.getartist(songinfo.artist)
+        album = artist.getalbum(songinfo.album)
+        song = album.getsong(songinfo.name)
+        st = {
+            'st_mode' : (S_IFREG | 0444),
+            'st_size' : song.size,
+            'st_ctime' : 0,
+            'st_mtime' : 0,
+            'st_atime' : 0
+        }
+        return st
+
 
     def getartists(self):
         artistnames = [cleanname(name) for name in self.__client.getartists()]
@@ -225,6 +256,12 @@ class GMusicProvider(Provider):
         songs = self.__client.getartist(artist).getalbum(album).getsongs()
         songnames = [cleanname(name) for name in songs]
         return songnames
+
+    def cleanup(self):
+        for uid in self.__closedfiles:
+            element = self.__closedfiles[uid]
+            element.filehandle.buffer.close()
+            del self.__closedfiles[uid]
 
 class GMusic(LoggingMixIn, Operations):
     '''
@@ -242,23 +279,14 @@ class GMusic(LoggingMixIn, Operations):
 
         parts = splitPath(path)
         if parts[0] == "artists" and len(parts) == 4:
-            artist = self.__musicprovider.getartist(parts[1])
-            album = artist.getalbum(parts[2])
-            song = album.getsong(parts[3])
-            st = {
-                'st_mode' : (S_IFREG | 0444),
-                'st_size' : song.size,
-                'st_ctime' : 0,
-                'st_mtime' : 0,
-                'st_atime' : 0
-            }
+            st = self.__musicprovider.getattr(SongInfo(parts[1], parts[2], parts[3]))
         return st
 
     def open(self, path, fh):
         fh = random.getrandbits(64)
         parts = splitPath(path)
         if parts[0] == "artists" and len(parts) == 4:
-            self.__musicprovider.opensong(parts[1], parts[2], parts[3], fh)
+            self.__musicprovider.opensong(SongInfo(parts[1], parts[2], parts[3]), fh)
         return fh
 
     def release(self, path, fh):
@@ -267,7 +295,7 @@ class GMusic(LoggingMixIn, Operations):
     def read(self, path, size, offset, fh):
         parts = splitPath(path)
         if parts[0] == "artists" and len(parts) == 4:
-            return self.__musicprovider.getsongbytes(fh, size, offset, parts[1], parts[2], parts[3])
+            return self.__musicprovider.getsongbytes(fh, size, offset, SongInfo(parts[1], parts[2], parts[3]))
 
     def readdir(self, path, fh):
         parts = splitPath(path)
@@ -283,6 +311,9 @@ class GMusic(LoggingMixIn, Operations):
             elif len(parts) == 3:
                 contents.extend(self.__musicprovider.getsongs(parts[1], parts[2]))
         return ['.', '..'] + contents
+
+    def destroy(self, path):
+        self.__musicprovider.cleanup()
 
 def main():
     parser = argparse.ArgumentParser(description="Fuse fs for accessing Google Music")
